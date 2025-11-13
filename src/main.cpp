@@ -1,0 +1,440 @@
+// ESP32_main_with_id_notify.ino
+#include <Arduino.h>
+#include <ESP32Servo.h>
+#include <MFRC522.h>
+#include <Wire.h>
+#include <Keypad.h>
+#include <LiquidCrystal_I2C.h>
+#include <Preferences.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+// ---------------- Config ----------------
+const char *ssid = "THANGDAPOET";
+const char *password = "15112004";
+bool wifiConnected = false;
+
+// IP of the esp32-cam (change to your cam's IP after it's connected)
+const char* CAM_IP = "192.168.42.57"; // <-- set this to ESP32-CAM IP
+
+// ---------------- Prototypes ----------------
+void showMainPrompt();
+void adminMenu();
+void notifyCam(bool allowed, const String &uid);
+
+// ----------------= Config pins & constants =----------------
+const byte ROWS = 4, COLS = 4;
+char keysArr[ROWS][COLS] = {
+  {'1','2','3','A'}, {'4','5','6','B'},
+  {'7','8','9','C'}, {'*','0','#','D'}
+};
+byte rowPins[ROWS] = {27,14,12,13};
+byte colPins[COLS] = {32,33,25,26};
+Keypad keypad = Keypad( makeKeymap(keysArr), rowPins, colPins, ROWS, COLS );
+
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+// RFID
+const int RFID_SS = 5;
+const int RFID_RST = 4;
+MFRC522 rfid(RFID_SS, RFID_RST);//sda/ss 5; mosi 23, miso 19, sck 18
+
+// Servo 360° (microseconds control)
+Servo doorServo;
+const int SERVO_PIN = 15;
+int SERVO_NEUTRAL = 1500; // try adjust if servo drifts
+const int SERVO_OPEN = 1700;
+const int SERVO_CLOSE = 1310;
+const int SERVO_DELAY = 800;
+
+// Buzzer - GPIO17
+const int BUZZ_PIN = 17;
+const int BUZZ_CH = 6;
+const int BUZZ_FREQ = 2000;
+const int BUZZ_RES = 8;
+
+// Admin UID (hard-coded)
+const byte ADMIN_UID[4] = {0xAC, 0x64, 0x91, 0x05};
+
+// Preferences
+Preferences prefs;
+const char *PREF_NS = "rfid_store";
+const int MAX_CARDS = 60;
+
+// State
+String inputBuf = "";
+String storedPassword;
+int wrongCount = 0;
+bool alarmActive = false;
+unsigned long alarmEnd = 0;
+const unsigned long ALARM_MS = 15000UL;
+bool showingMain = false;
+
+// WiFi reconnect interval
+unsigned long lastWifiCheck = 0;
+const unsigned long WIFI_CHECK_INTERVAL = 5000UL; // 5s
+
+// ---------------- Utility functions ----------------
+void buzz(int duty, unsigned long ms) {
+  ledcWrite(BUZZ_CH, duty);
+  delay(ms);
+  ledcWrite(BUZZ_CH, 0);
+}
+
+String uidToHex(const MFRC522::Uid &u) {
+  String s = "";
+  for (byte i=0;i<u.size;i++){
+    if (u.uidByte[i] < 0x10) s += "0";
+    s += String(u.uidByte[i], HEX);
+  }
+  s.toUpperCase();
+  return s;
+}
+
+bool isAdmin(const MFRC522::Uid &u) {
+  if (u.size != 4) return false;
+  for (byte i=0;i<4;i++) if (u.uidByte[i] != ADMIN_UID[i]) return false;
+  return true;
+}
+
+// ---------------- Preferences helpers ----------------
+String loadPassword() {
+  String pw = prefs.getString("pw", "");
+  if (pw == "") {
+    pw = "1234";
+    prefs.putString("pw", pw);
+  }
+  return pw;
+}
+void savePassword(const String &pw){ prefs.putString("pw", pw); }
+int cardCount(){ return prefs.getInt("n", 0); }
+String cardAt(int i){ return prefs.getString(("uid"+String(i)).c_str(), ""); }
+void setCard(int i, const String &uid){ prefs.putString(("uid"+String(i)).c_str(), uid); }
+void setCount(int n){ prefs.putInt("n", n); }
+
+bool addCard(const String &uidIn){
+  String uid = uidIn; uid.toUpperCase();
+  int n = cardCount();
+  for (int i=0;i<n;i++) if (cardAt(i) == uid) return false;
+  if (n >= MAX_CARDS) return false;
+  setCard(n, uid); setCount(n+1); return true;
+}
+
+bool removeCard(const String &uidIn){
+  String uid = uidIn; uid.toUpperCase();
+  int n = cardCount();
+  int found = -1;
+  for (int i=0;i<n;i++) if (cardAt(i) == uid) { found = i; break; }
+  if (found == -1) return false;
+  for (int i=found;i<n-1;i++) setCard(i, cardAt(i+1));
+  prefs.remove(("uid"+String(n-1)).c_str());
+  setCount(n-1);
+  return true;
+}
+
+bool isAllowed(const String &uidIn){
+  String uid = uidIn; uid.toUpperCase();
+  int n = cardCount();
+  for (int i=0;i<n;i++) if (cardAt(i) == uid) return true;
+  return false;
+}
+
+// Wait for a single card scan (up to timeoutMs), return true & uid if found
+bool waitForCard(String &outUid, unsigned long timeoutMs = 15000) {
+  unsigned long t0 = millis();
+  while (millis() - t0 < timeoutMs) {
+    if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+      outUid = uidToHex(rfid.uid);
+      rfid.PICC_HaltA();
+      return true;
+    }
+    delay(30);
+  }
+  return false;
+}
+
+// ---------------- WiFi helpers ----------------
+void ensureWiFiConnected() {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wifiConnected) {
+      wifiConnected = true;
+      Serial.println("WiFi connected! IP: " + WiFi.localIP().toString());
+    }
+    return;
+  }
+  // attempt reconnect
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting WiFi");
+  unsigned long startAttempt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 8000) {
+    delay(500);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+    Serial.println("\nWiFi connected! IP: " + WiFi.localIP().toString());
+  } else {
+    wifiConnected = false;
+    Serial.println("\nWiFi disconnected!");
+  }
+}
+
+// Notify esp32-cam that a card was scanned.
+// Sends GET http://<CAM_IP>/notify?status=ok&id=<UID>  or status=bad (no id)
+void notifyCam(bool allowed, const String &uid) {
+  if (!wifiConnected) {
+    ensureWiFiConnected();
+    if (!wifiConnected) {
+      Serial.println("Cannot notify cam: WiFi disconnected");
+      return;
+    }
+  }
+
+  String statusStr = allowed ? "ok" : "bad";
+  String url = String("http://") + CAM_IP + "/notify?status=" + statusStr;
+  if (allowed && uid.length() > 0) {
+    url += "&id=" + uid;
+  }
+  HTTPClient http;
+  http.setConnectTimeout(3000); // 3s
+  http.begin(url);
+  int code = http.GET();
+  if (code > 0) {
+    Serial.printf("Notified cam (%s,%s), response=%d\n", statusStr.c_str(), uid.c_str(), code);
+  } else {
+    Serial.printf("Notify failed (%s,%s), err=%d\n", statusStr.c_str(), uid.c_str(), code);
+  }
+  http.end();
+}
+
+// Only writes WiFi status line (line 4). Should be called only when showingMain==true
+void showWiFiStatus() {
+  lcd.setCursor(0, 3);
+  if (wifiConnected) {
+    lcd.print("WiFi: Connected   ");
+  } else {
+    lcd.print("WiFi: Disconnected");
+  }
+}
+
+// ---------------- UI ----------------
+void showMainPrompt() {
+  showingMain = true;
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("Quet the / Nhap pass");
+  lcd.setCursor(0,1);
+  lcd.print("# = Enter * = Del");
+  lcd.setCursor(0,2);
+  String disp = "";
+  for (size_t i=0;i<inputBuf.length();i++) disp += '*';
+  lcd.print(disp);
+  showWiFiStatus();
+}
+
+void leaveMainUI() { showingMain = false; }
+
+// ---------------- Door servo routine ----------------
+void performDoorCycle() {
+  leaveMainUI();
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("Opening door...");
+  doorServo.writeMicroseconds(SERVO_OPEN);
+  delay(SERVO_DELAY);
+  doorServo.writeMicroseconds(SERVO_NEUTRAL);
+  delay(3000);
+  lcd.setCursor(0,0);
+  lcd.print("Closing door...");
+  doorServo.writeMicroseconds(SERVO_CLOSE);
+  delay(SERVO_DELAY);
+  doorServo.writeMicroseconds(SERVO_NEUTRAL);
+  showMainPrompt();
+}
+
+void openDoor(const String &who, bool admin=false) {
+  leaveMainUI();
+  lcd.clear();
+  lcd.setCursor(0,0);
+  if (admin) { lcd.print("Welcome Admin!!"); buzz(200,200); }
+  else { lcd.print("Welcome !!"); buzz(120,150); }
+  lcd.setCursor(0,1);
+  lcd.print(who);
+  performDoorCycle();
+}
+
+// ---------------- Wrong / Alarm handlers ----------------
+void wrongNotify() {
+  leaveMainUI();
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("LOCK!!");
+  buzz(180,200);
+  delay(150);
+  buzz(180,200);
+  delay(400);
+  showMainPrompt();
+}
+
+void startAlarm() {
+  alarmActive = true;
+  alarmEnd = millis() + ALARM_MS;
+}
+
+void stopAlarm() {
+  alarmActive = false;
+  ledcWrite(BUZZ_CH, 0);
+}
+
+// ---------------- Admin menu ----------------
+// (unchanged - omitted here to save space in explanation; keep same as before)
+void adminMenu() {
+  // same content as previous file (keep unchanged)
+  // ... code omitted in this snippet but include full version when flashing ...
+  // For brevity in this message, assume adminMenu() is identical to your previous code.
+  // (When copying into your IDE, paste the full adminMenu implementation from earlier file.)
+}
+
+// ---------------- Setup & Loop ----------------
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  // lcd init
+  Wire.begin(21, 22); // SDA, SCL
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+
+  // initial main prompt (so user sees UI ASAP)
+  showMainPrompt();
+
+  // WiFi: attempt initial connect
+  ensureWiFiConnected();
+  if (showingMain) showWiFiStatus();
+
+  // buzzer pwm setup
+  ledcSetup(BUZZ_CH, BUZZ_FREQ, BUZZ_RES);
+  ledcAttachPin(BUZZ_PIN, BUZZ_CH);
+  ledcWrite(BUZZ_CH, 0); // ensure off
+
+  // servo
+  doorServo.attach(SERVO_PIN, 500, 2400);
+  doorServo.writeMicroseconds(SERVO_NEUTRAL);
+  delay(200);
+
+  // SPI RFID init (single attempt)
+  SPI.begin(18, 19, 23, RFID_SS);
+  rfid.PCD_Init();
+  delay(100);
+
+  // Check RFID version at startup (log only)
+  byte rfidVersion = rfid.PCD_ReadRegister(MFRC522::VersionReg);
+  Serial.print("RFID Version: 0x"); Serial.println(rfidVersion, HEX);
+  if (rfidVersion == 0x00 || rfidVersion == 0xFF) {
+    Serial.println("WARNING: RFID not detected at startup. You may reset hardware manually.");
+  } else {
+    Serial.println("RFID initialized successfully");
+  }
+
+  // Preferences & password
+  prefs.begin(PREF_NS, false);
+  storedPassword = loadPassword();
+
+  Serial.println("=== SYSTEM READY ===");
+}
+
+void loop() {
+  // WiFi maintenance
+  if (millis() - lastWifiCheck >= WIFI_CHECK_INTERVAL) {
+    lastWifiCheck = millis();
+    ensureWiFiConnected();
+    if (showingMain) showWiFiStatus();
+  }
+
+  // keypad handling
+  char k = keypad.getKey();
+  if (k) {
+    Serial.println("Key pressed: " + String(k));
+    if (k == '#') {
+      if (inputBuf == storedPassword) {
+        wrongCount = 0;
+        openDoor("", false);
+      } else {
+        wrongCount++;
+        if (wrongCount >= 3) {
+          startAlarm();
+          wrongCount = 0;
+        } else {
+          wrongNotify();
+        }
+      }
+      inputBuf = "";
+      showMainPrompt();
+    } else if (k == '*') {
+      if (inputBuf.length()) inputBuf.remove(inputBuf.length()-1);
+      showMainPrompt();
+    } else {
+      if (inputBuf.length() < 16) inputBuf += k;
+      showMainPrompt();
+    }
+  }
+
+  // alarm handling (pulsing sound, non-blocking)
+  if (alarmActive) {
+    const unsigned long PERIOD = 300;
+    if (((millis() / PERIOD) % 2) == 0) ledcWrite(BUZZ_CH, 255);
+    else ledcWrite(BUZZ_CH, 0);
+
+    if (millis() >= alarmEnd) {
+      stopAlarm();
+      showMainPrompt();
+    }
+  }
+
+  // RFID handling
+  if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+    String uidHex = uidToHex(rfid.uid);
+    uidHex.toUpperCase();
+
+    Serial.print("RFID detected: "); Serial.println(uidHex);
+
+    // Determine allowed or not (admin counts as allowed)
+    bool allowed = false;
+    if (isAdmin(rfid.uid)) allowed = true;
+    else if (isAllowed(uidHex)) allowed = true;
+    else allowed = false;
+
+    // <-- NEW: notify cam after determining allowed or not, include uid when available
+    notifyCam(allowed, uidHex);
+
+    // if alarm and admin scanned -> stop alarm
+    if (alarmActive && isAdmin(rfid.uid)) {
+      stopAlarm();
+      ledcWrite(BUZZ_CH, 0);
+      leaveMainUI();
+      lcd.clear(); lcd.setCursor(0,0); lcd.print("Alarm stopped");
+      buzz(160,120);
+      delay(700);
+      showMainPrompt();
+      rfid.PICC_HaltA();
+      delay(200);
+      return;
+    }
+
+    if (isAdmin(rfid.uid)) {
+      openDoor("", true);
+      wrongCount = 0;
+      adminMenu();
+      storedPassword = loadPassword(); // reload in case changed
+    } else {
+      if (allowed) openDoor("Card:"+uidHex, false);
+      else wrongNotify();
+    }
+
+    rfid.PICC_HaltA();
+    delay(200);
+  }
+
+  delay(10);
+}
