@@ -1,4 +1,4 @@
-// ESP32_main_with_id_notify.ino
+// ESP32_main_async_notify.ino
 #include <Arduino.h>
 #include <ESP32Servo.h>
 #include <MFRC522.h>
@@ -10,17 +10,17 @@
 #include <HTTPClient.h>
 
 // ---------------- Config ----------------
-const char *ssid = "THANGDAPOET";
+const char *ssid = "Thang";
 const char *password = "15112004";
 bool wifiConnected = false;
 
 // IP of the esp32-cam (change to your cam's IP after it's connected)
-const char* CAM_IP = "192.168.42.57"; // <-- set this to ESP32-CAM IP
+const char* CAM_IP = "192.168.1.100"; // <-- set this to ESP32-CAM IP
 
 // ---------------- Prototypes ----------------
 void showMainPrompt();
 void adminMenu();
-void notifyCam(bool allowed, const String &uid);
+void notifyCamAsync(bool allowed, const String &uid); // async notify
 
 // ----------------= Config pins & constants =----------------
 const byte ROWS = 4, COLS = 4;
@@ -179,32 +179,78 @@ void ensureWiFiConnected() {
   }
 }
 
-// Notify esp32-cam that a card was scanned.
-// Sends GET http://<CAM_IP>/notify?status=ok&id=<UID>  or status=bad (no id)
-void notifyCam(bool allowed, const String &uid) {
-  if (!wifiConnected) {
-    ensureWiFiConnected();
-    if (!wifiConnected) {
-      Serial.println("Cannot notify cam: WiFi disconnected");
-      return;
+// ---------------- Async notify (FreeRTOS task) ----------------
+struct NotifyParams {
+  bool allowed;
+  char uid[33]; // up to 32 chars + null
+};
+
+void notifyTask(void *pvParameters) {
+  NotifyParams *p = (NotifyParams*)pvParameters;
+  if (!p) {
+    vTaskDelete(NULL);
+    return;
+  }
+
+  // ensure WiFi connected (try quick reconnect if needed)
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.begin(ssid, password);
+    unsigned long t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 3000) {
+      vTaskDelay(200 / portTICK_PERIOD_MS);
     }
   }
 
-  String statusStr = allowed ? "ok" : "bad";
+  String statusStr = p->allowed ? "ok" : "bad";
   String url = String("http://") + CAM_IP + "/notify?status=" + statusStr;
-  if (allowed && uid.length() > 0) {
-    url += "&id=" + uid;
+  if (p->allowed && strlen(p->uid) > 0) {
+    url += "&id=" + String(p->uid);
   }
+
   HTTPClient http;
-  http.setConnectTimeout(3000); // 3s
+  http.setConnectTimeout(1500); // 1.5s
   http.begin(url);
   int code = http.GET();
   if (code > 0) {
-    Serial.printf("Notified cam (%s,%s), response=%d\n", statusStr.c_str(), uid.c_str(), code);
+    Serial.printf("Notify (async) %s,%s -> %d\n", statusStr.c_str(), p->uid, code);
   } else {
-    Serial.printf("Notify failed (%s,%s), err=%d\n", statusStr.c_str(), uid.c_str(), code);
+    Serial.printf("Notify (async) failed %s,%s err=%d\n", statusStr.c_str(), p->uid, code);
   }
   http.end();
+
+  free(p);
+  vTaskDelete(NULL);
+}
+
+void notifyCamAsync(bool allowed, const String &uid) {
+  NotifyParams *p = (NotifyParams*)malloc(sizeof(NotifyParams));
+  if (!p) {
+    Serial.println("notifyCamAsync: malloc failed");
+    return;
+  }
+  p->allowed = allowed;
+  memset(p->uid, 0, sizeof(p->uid));
+  if (uid.length() > 0) {
+    String tmp = uid;
+    tmp.toUpperCase();
+    tmp = tmp.substring(0, 32);
+    tmp.toCharArray(p->uid, sizeof(p->uid));
+  }
+
+  BaseType_t r = xTaskCreatePinnedToCore(
+    notifyTask,         // task function
+    "notifyTask",       // name
+    4096,               // stack size
+    p,                  // param
+    1,                  // priority
+    NULL,               // task handle
+    1                   // core
+  );
+
+  if (r != pdPASS) {
+    Serial.println("notifyCamAsync: xTaskCreate failed");
+    free(p);
+  }
 }
 
 // Only writes WiFi status line (line 4). Should be called only when showingMain==true
@@ -287,12 +333,95 @@ void stopAlarm() {
 }
 
 // ---------------- Admin menu ----------------
-// (unchanged - omitted here to save space in explanation; keep same as before)
 void adminMenu() {
-  // same content as previous file (keep unchanged)
-  // ... code omitted in this snippet but include full version when flashing ...
-  // For brevity in this message, assume adminMenu() is identical to your previous code.
-  // (When copying into your IDE, paste the full adminMenu implementation from earlier file.)
+  leaveMainUI();
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("ADMIN MODE");
+  lcd.setCursor(0,1);
+  lcd.print("1:CHG 2:DEL 3:ADD C:Exit");
+  unsigned long start = millis();
+  while (millis() - start < 15000UL) {
+    char k = keypad.getKey();
+    if (!k) { delay(30); continue; }
+    if (k == 'C' || k == 'c' || k == 'D') {
+      lcd.clear(); lcd.setCursor(0,0); lcd.print("Exit Admin");
+      delay(300); showMainPrompt(); return;
+    }
+    if (k == '1') {
+      lcd.clear(); lcd.setCursor(0,0); lcd.print("CHANGE PASS");
+      lcd.setCursor(0,1); lcd.print("Enter new pass:");
+      String newPw = "";
+      unsigned long t0 = millis();
+      while (millis() - t0 < 15000UL) {
+        char kk = keypad.getKey();
+        if (kk) {
+          t0 = millis();
+          if (kk == '#') {
+            if (newPw.length() > 0) {
+              savePassword(newPw);
+              storedPassword = newPw;
+              lcd.clear(); lcd.setCursor(0,0); lcd.print("SAVED");
+              buzz(160,150);
+              delay(800);
+              showMainPrompt();
+              return;
+            }
+          } else if (kk == '*') {
+            if (newPw.length()) newPw.remove(newPw.length()-1);
+          } else {
+            if (newPw.length() < 16) newPw += kk;
+          }
+          lcd.setCursor(0,2);
+          String ds = "";
+          for (size_t i=0;i<newPw.length();i++) ds += '*';
+          lcd.print("                ");
+          lcd.setCursor(0,2);
+          lcd.print(ds);
+        }
+        delay(30);
+      }
+      // timeout
+      if (newPw.length() > 0) {
+        savePassword(newPw);
+        storedPassword = newPw;
+        lcd.clear(); lcd.setCursor(0,0); lcd.print("SAVED");
+        buzz(160,150);
+        delay(800);
+        showMainPrompt(); return;
+      } else {
+        lcd.clear(); lcd.setCursor(0,0); lcd.print("No input"); delay(600); showMainPrompt(); return;
+      }
+    }
+    if (k == '2') {
+      lcd.clear(); lcd.setCursor(0,0); lcd.print("DEL TAG: Scan");
+      String uid;
+      if (waitForCard(uid, 15000UL)) {
+        uid.toUpperCase();
+        if (removeCard(uid)) {
+          lcd.clear(); lcd.setCursor(0,0); lcd.print("Deleted:"); lcd.setCursor(0,1); lcd.print(uid); buzz(160,120);
+        } else {
+          lcd.clear(); lcd.setCursor(0,0); lcd.print("Not found"); buzz(60,200);
+        }
+        delay(900); showMainPrompt(); return;
+      } else {
+        lcd.clear(); lcd.setCursor(0,0); lcd.print("No card"); delay(700); showMainPrompt(); return;
+      }
+    }
+    if (k == '3') {
+      lcd.clear(); lcd.setCursor(0,0); lcd.print("ADD TAG: Scan");
+      String uid;
+      if (waitForCard(uid, 15000UL)) {
+        uid.toUpperCase();
+        if (addCard(uid)) { lcd.clear(); lcd.setCursor(0,0); lcd.print("Added:"); lcd.setCursor(0,1); lcd.print(uid); buzz(160,120); }
+        else { lcd.clear(); lcd.setCursor(0,0); lcd.print("Exists/Full"); buzz(60,200); }
+        delay(900); showMainPrompt(); return;
+      } else {
+        lcd.clear(); lcd.setCursor(0,0); lcd.print("No card"); delay(700); showMainPrompt(); return;
+      }
+    }
+  }
+  lcd.clear(); lcd.setCursor(0,0); lcd.print("Admin timeout"); delay(600); showMainPrompt(); return;
 }
 
 // ---------------- Setup & Loop ----------------
@@ -333,6 +462,7 @@ void setup() {
   Serial.print("RFID Version: 0x"); Serial.println(rfidVersion, HEX);
   if (rfidVersion == 0x00 || rfidVersion == 0xFF) {
     Serial.println("WARNING: RFID not detected at startup. You may reset hardware manually.");
+    // Do NOT block; continue running. You will manually reset if needed.
   } else {
     Serial.println("RFID initialized successfully");
   }
@@ -382,6 +512,7 @@ void loop() {
 
   // alarm handling (pulsing sound, non-blocking)
   if (alarmActive) {
+    // beep pattern: 300ms on / 300ms off
     const unsigned long PERIOD = 300;
     if (((millis() / PERIOD) % 2) == 0) ledcWrite(BUZZ_CH, 255);
     else ledcWrite(BUZZ_CH, 0);
@@ -392,7 +523,7 @@ void loop() {
     }
   }
 
-  // RFID handling
+  // RFID handling (single init only, assume hardware present)
   if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
     String uidHex = uidToHex(rfid.uid);
     uidHex.toUpperCase();
@@ -405,8 +536,8 @@ void loop() {
     else if (isAllowed(uidHex)) allowed = true;
     else allowed = false;
 
-    // <-- NEW: notify cam after determining allowed or not, include uid when available
-    notifyCam(allowed, uidHex);
+    // <-- NEW: notify cam ASYNC after determining allowed or not, include uid when available
+    notifyCamAsync(allowed, uidHex);
 
     // if alarm and admin scanned -> stop alarm
     if (alarmActive && isAdmin(rfid.uid)) {
