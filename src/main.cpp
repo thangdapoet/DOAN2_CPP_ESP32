@@ -14,7 +14,7 @@ const char *password = "15112004";
 bool wifiConnected = false;
 
 // IP of the esp32-cam (change to your cam's IP after it's connected)
-const char* CAM_IP = "192.168.18.57"; // <-- set this to ESP32-CAM IP
+const char* CAM_IP = "192.168.184.57"; // <-- set this to ESP32-CAM IP
 
 // ---------------- Prototypes ----------------
 void showMainPrompt();
