@@ -1,4 +1,3 @@
-// ESP32_main_async_notify.ino
 #include <Arduino.h>
 #include <ESP32Servo.h>
 #include <MFRC522.h>
@@ -21,6 +20,7 @@ const char* CAM_IP = "192.168.18.57"; // <-- set this to ESP32-CAM IP
 void showMainPrompt();
 void adminMenu();
 void notifyCamAsync(bool allowed, const String &uid); // async notify
+void wifiTask(void *pv);
 
 // ----------------= Config pins & constants =----------------
 const byte ROWS = 4, COLS = 4;
@@ -70,9 +70,9 @@ unsigned long alarmEnd = 0;
 const unsigned long ALARM_MS = 15000UL;
 bool showingMain = false;
 
-// WiFi reconnect interval
+// WiFi reconnect interval (not used by loop anymore)
 unsigned long lastWifiCheck = 0;
-const unsigned long WIFI_CHECK_INTERVAL = 5000UL; // 5s
+const unsigned long WIFI_CHECK_INTERVAL = 5000UL; // kept for compatibility
 
 // ---------------- Utility functions ----------------
 void buzz(int duty, unsigned long ms) {
@@ -155,6 +155,7 @@ bool waitForCard(String &outUid, unsigned long timeoutMs = 15000) {
 
 // ---------------- WiFi helpers ----------------
 void ensureWiFiConnected() {
+  // kept for compatibility but NOT used in loop anymore
   if (WiFi.status() == WL_CONNECTED) {
     if (!wifiConnected) {
       wifiConnected = true;
@@ -162,12 +163,12 @@ void ensureWiFiConnected() {
     }
     return;
   }
-  // attempt reconnect
+  // attempt reconnect (blocking short)
   WiFi.begin(ssid, password);
   Serial.print("Connecting WiFi");
   unsigned long startAttempt = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 8000) {
-    delay(500);
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 1500) { // short try
+    delay(200);
     Serial.print(".");
   }
   if (WiFi.status() == WL_CONNECTED) {
@@ -438,9 +439,16 @@ void setup() {
   // initial main prompt (so user sees UI ASAP)
   showMainPrompt();
 
-  // WiFi: attempt initial connect
-  ensureWiFiConnected();
-  if (showingMain) showWiFiStatus();
+  // Start WiFi task (handles reconnect non-blocking)
+  xTaskCreatePinnedToCore(
+    wifiTask,
+    "wifiTask",
+    4096,
+    NULL,
+    1,
+    NULL,
+    0 // run on core 0
+  );
 
   // buzzer pwm setup
   ledcSetup(BUZZ_CH, BUZZ_FREQ, BUZZ_RES);
@@ -475,11 +483,11 @@ void setup() {
 }
 
 void loop() {
-  // WiFi maintenance
-  if (millis() - lastWifiCheck >= WIFI_CHECK_INTERVAL) {
-    lastWifiCheck = millis();
-    ensureWiFiConnected();
+  // Update LCD WiFi status only when the state changes and main is showing
+  static bool lastWifiState = false;
+  if (wifiConnected != lastWifiState) {
     if (showingMain) showWiFiStatus();
+    lastWifiState = wifiConnected;
   }
 
   // keypad handling
@@ -536,7 +544,7 @@ void loop() {
     else if (isAllowed(uidHex)) allowed = true;
     else allowed = false;
 
-    // <-- NEW: notify cam ASYNC after determining allowed or not, include uid when available
+    // notify cam ASYNC after determining allowed or not, include uid when available
     notifyCamAsync(allowed, uidHex);
 
     // if alarm and admin scanned -> stop alarm
@@ -568,4 +576,33 @@ void loop() {
   }
 
   delay(10);
+}
+
+void wifiTask(void *pv) {
+  (void) pv;
+  for (;;) {
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("wifiTask: starting connect attempt");
+      WiFi.begin(ssid, password);
+      unsigned long t0 = millis();
+      while (WiFi.status() != WL_CONNECTED && millis() - t0 < 3000) {
+        vTaskDelay(200 / portTICK_PERIOD_MS);
+      }
+      if (WiFi.status() == WL_CONNECTED) {
+        wifiConnected = true;
+        Serial.println("wifiTask: connected, IP: " + WiFi.localIP().toString());
+      } else {
+        wifiConnected = false;
+        Serial.println("wifiTask: not connected");
+      }
+    } else {
+      // keep flag consistent
+      if (!wifiConnected) {
+        wifiConnected = true;
+        Serial.println("wifiTask: status changed to connected");
+      }
+    }
+
+    vTaskDelay(3000 / portTICK_PERIOD_MS);
+  }
 }
