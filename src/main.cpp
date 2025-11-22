@@ -14,7 +14,7 @@ const char *password = "15112004";
 bool wifiConnected = false;
 
 // IP of the esp32-cam (change to your cam's IP after it's connected)
-const char* CAM_IP = "192.168.184.57"; // <-- set this to ESP32-CAM IP
+const char* CAM_IP = "192.168.212.57"; // <-- set this to ESP32-CAM IP
 
 // ---------------- Prototypes ----------------
 void showMainPrompt();
@@ -35,7 +35,7 @@ Keypad keypad = Keypad( makeKeymap(keysArr), rowPins, colPins, ROWS, COLS );
 LiquidCrystal_I2C lcd(0x27, 20, 4);
 
 // RFID
-const int RFID_SS = 5;
+const int RFID_SS = 2;
 const int RFID_RST = 4;
 MFRC522 rfid(RFID_SS, RFID_RST);//sda/ss 5; mosi 23, miso 19, sck 18
 
