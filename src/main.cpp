@@ -14,7 +14,7 @@ const char *password = "15112004";
 bool wifiConnected = false;
 
 // IP of the esp32-cam (change to your cam's IP after it's connected)
-const char* CAM_IP = "192.168.212.57"; // <-- set this to ESP32-CAM IP
+const char* CAM_IP = "192.168.196.57"; // <-- set this to ESP32-CAM IP
 
 // ---------------- Prototypes ----------------
 void showMainPrompt();
@@ -37,7 +37,7 @@ LiquidCrystal_I2C lcd(0x27, 20, 4);
 // RFID
 const int RFID_SS = 2;
 const int RFID_RST = 4;
-MFRC522 rfid(RFID_SS, RFID_RST);//sda/ss 5; mosi 23, miso 19, sck 18
+MFRC522 rfid(RFID_SS, RFID_RST);//sda/ss 2; mosi 23, miso 19, sck 18
 
 // Servo 360° (microseconds control)
 Servo doorServo;
@@ -211,7 +211,7 @@ void notifyTask(void *pvParameters) {
   HTTPClient http;
   http.setConnectTimeout(1500); // 1.5s
   http.begin(url);
-  int code = http.GET();
+  int code = http.POST("");
   if (code > 0) {
     Serial.printf("Notify (async) %s,%s -> %d\n", statusStr.c_str(), p->uid, code);
   } else {
